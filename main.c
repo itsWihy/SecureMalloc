@@ -31,6 +31,8 @@ int main(void) {
             continue;
         }
 
+        //https://elixir.bootlin.com/glibc/glibc-2.44.9000/source/malloc/malloc.c
+
         if (strstr(input_buffer, "free") != 0) {
             void* ptr = alloc_struct[idx];
             secure_free(ptr);
