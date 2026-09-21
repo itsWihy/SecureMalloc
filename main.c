@@ -5,6 +5,8 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include "utils/utils.h"
+
 size_t* alloc_struct[100];
 
 int main(void) {
@@ -13,7 +15,7 @@ int main(void) {
 
     //[*] Function (malloc/free/puts/read/quit):
     while (1) {
-        printf("\n[*] Function (malloc/free/puts/read/quit): \n");
+        printf("\n[*] Function (malloc/free/write/puts/read/quit): \n");
         fscanf(stdin, "%99s", input_buffer);
         scanf("%d", &idx);
 
@@ -40,8 +42,9 @@ int main(void) {
             printf("allocation[%d] = %p freed.\n", idx, ptr);
         }
 
-        if (strstr(input_buffer, "malloc") != 0) {
-
+        if (strstr(input_buffer, "write") != 0) {
+            void* ptr = alloc_struct[idx];
+            hexdump(ptr-0x10, 0x100);
         }
     }
     return 0;

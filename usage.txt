@@ -1,0 +1,17 @@
+from pwn import *
+
+
+context.arch = 'amd64'
+context.terminal = ['alacritty', '-e']
+
+gdbscript = """
+c
+"""
+
+p = gdb.debug(["/home/Wihy/Projects/C/SecureMalloc/cmake-build-debug/SecureMalloc"], gdbscript)
+
+p.sendline(f'malloc 0 {0x13370000}'.encode())
+p.sendline(b'write 0')
+p.sendline(b'free 0')
+
+p.interactive()
