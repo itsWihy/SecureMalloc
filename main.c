@@ -10,6 +10,9 @@
 size_t* alloc_struct[100];
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdin, NULL, _IONBF, 0); //so printf in allocator doesnt cause issues.
+
     char input_buffer[100];
     int idx;
 
