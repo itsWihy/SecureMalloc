@@ -33,8 +33,11 @@ typedef struct mmap_header {
 
 typedef struct tcache_entry tcache_entry;
 
+
+//TCACHE FORAMTTING:
+//-------- PREV SIZE, SIZE  ....... NEXT FD  KEY .....
 struct tcache_entry {
-    tcache_entry* next;
+    tcache_entry* next; //stores PTR TO HEADER!!
     size_t key;
 };
 
@@ -67,18 +70,20 @@ void *secure_malloc(const size_t size) {
         const size_t idx = (aligned_size - 0x20) / 0x10;
         printf("idx requested: %lu", idx);
 
+        //there is valid bin for this
         if (tcache.bin_counts[idx] > 0) {
-            void* ptr = tcache.entries[idx];
+            void* ptr = tcache.entries[idx] + 0x10;
             void* next_ptr = tcache.entries[idx]->next;
 
-            ((size_t*)ptr)[0] = 0; //Zero out next
-            ((size_t*)ptr)[1] = 0; //Zero out key
+            ((size_t*)ptr)[0] = 0; //Zero out next !!! WRONG!!!! WE PUT THE KEY/FD IN THE MIDDLE!!!!
+            ((size_t*)ptr)[1] = 0; //Zero out key !!! WRONG!!!! WE PUT THE KEY/FD IN THE MIDDLE!!!!
 
             tcache.entries[idx] = next_ptr;
             tcache.bin_counts[idx]--;
 
             //Set previnuse of next chunk!
             if (next_ptr != NULL) {
+                ((int*)next_ptr)[1] &= CHUNK_PREVINUSE; //todo lol
                 //TODO: Tcache bro. if it's empty- carve out the chunks from SBRK!!! that's the easiest way. 
             }
 
