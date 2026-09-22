@@ -21,6 +21,9 @@
 #define IS_MMAPED(sz) ((sz) & CHUNK_MMAPED)
 #define IS_PREVINUSE(sz) ((sz) & CHUNK_PREVINUSE)
 
+//largebin stuff
+#define LARGEBIN_BINS 64
+
 //TCACHE STUFF
 #define TCACHE_BINS 64
 #define MAX_CHUNKS_PER_BIN 10
@@ -39,12 +42,9 @@ typedef struct mmap_header {
     size_t size;
 } mmap_header;
 
-typedef struct tcache_entry tcache_entry;
-
 //TCACHE FORAMTTING:
-//-------- PREV SIZE, SIZE  ....... NEXT FD  KEY .....
+//-------- PREV SIZE, SIZE  ....... NEXT FD .....
 typedef struct {
-    //bins store ACTUAL SIZE. meaning HEADER + bin.
     uint16_t bin_counts[TCACHE_BINS];
     void *entries[TCACHE_BINS];
 } tcache_perthread_struct;
@@ -56,8 +56,21 @@ static __thread size_t secret = 0;
 
 //Different IDXs map to different chunk locations for better security.
 void *get_next_tcache(size_t idx);
-
 void set_next_tcache(size_t idx, size_t value);
+
+typedef struct {
+    size_t prev_size;
+    size_t size;
+    //prev is at size/2
+    //next is at size/2+1
+    //prev_size is at size/2+2
+    //next_size is at size/2+3
+} largebin_entry;
+
+static largebin_entry* largebin_head; //holds a linked list.
+
+static size_t* get_ptr_to_largebin_middle(largebin_entry* entry);
+static size_t get_idx_from_size(size_t total_size);
 
 void *secure_malloc(const size_t size) {
     if (secret == 0)
@@ -93,25 +106,40 @@ void *secure_malloc(const size_t size) {
 
             return ptr;
         }
+        //there is no valid tcache chunk. Continue search.
+    }
 
-        //there is no valid tcache chunk. Carve from sbrk.
-        void *chunk = sbrk((long)total_size);
+    //Largebin check!
+    largebin_entry* largebin_ptr = largebin_head;
 
-        ((uint64_t *) chunk)[0] = 0;
-        ((uint64_t *) chunk)[1] = total_size | CHUNK_PREVINUSE; // SIZE IS ALWAYS CHUNK SIZE! NOT PTR SIZE!
+    if (largebin_ptr != NULL) {
+        //get minimally large ptr!
+        while (largebin_ptr->size >= total_size) {
+            const size_t* middle_ptr = get_ptr_to_largebin_middle(largebin_ptr);
+            largebin_ptr = (largebin_entry*)middle_ptr[1];
+        }
 
-        return CHUNK_TO_PTR(chunk);
+        //OK. rn, the PREV is the target!
+        const size_t* middle_ptr = get_ptr_to_largebin_middle(largebin_ptr);
+        largebin_ptr = (largebin_entry*)middle_ptr[0];
+
+        //TODO: Split off the chunk instead of just returning TS
+        return largebin_ptr;
     }
 
     //continue and fall onto unsorted/fastbin/large/small/gay
-    return NULL;
-}
+
+    //no largebins at all... just sbrk.
+    void *chunk = sbrk((long)total_size);
+
+    ((uint64_t *) chunk)[0] = 0;
+    ((uint64_t *) chunk)[1] = total_size | CHUNK_PREVINUSE; // SIZE IS ALWAYS CHUNK SIZE! NOT PTR SIZE!
+    return CHUNK_TO_PTR(chunk);}
 
 void secure_free(void *ptr) {
     if (ptr == NULL) return;
 
-    size_t raw_size = ((size_t *) ptr - 1)[0];
-    printf("received size: %lx\n", raw_size);
+    const size_t raw_size = ((size_t *) ptr - 1)[0];
 
     if (IS_MMAPED(raw_size)) {
         const size_t size = raw_size & ~FLAG_MASK;
@@ -140,6 +168,23 @@ void secure_free(void *ptr) {
         next_physical_chunk[0] = total_size; //set prev size of next chunk.
         next_physical_chunk[1] &= ~CHUNK_PREVINUSE; //prev chunk is NOT in use.
         return;
+    }
+
+    //Free as a largebin chank.
+    if (largebin_head == NULL) {
+        largebin_head = PTR_TO_CHUNK(ptr);
+        largebin_head->prev_size = 0;
+        largebin_head->size      = total_size;
+
+        size_t* largebin_mid = get_ptr_to_largebin_middle(largebin_head);
+        largebin_mid[0] = 0;
+        largebin_mid[1] = 0;
+        largebin_mid[2] = 0;
+        largebin_mid[3] = 0; // ZERO OUT prev, next, prevfd, nextfd
+        //zero out all other PTRs.
+    } else {
+        //find best location.
+
     }
 }
 
@@ -173,4 +218,8 @@ void set_next_tcache(const size_t idx, size_t value) {
     void *chunk_header = tcache.entries[idx];
     size_t *ptr_to_middle = (size_t *) ((char *) chunk_header + CHUNK_MIDDLE(idx));
     *ptr_to_middle = value;
+}
+
+static inline size_t * get_ptr_to_largebin_middle(largebin_entry *entry) {
+    return (size_t*)((char*)entry + (entry->size/2 & ~0xF));
 }
