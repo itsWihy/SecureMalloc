@@ -27,7 +27,10 @@
 #define MIN_CHUNK_SIZE 0x20
 #define TCACHE_CHUNK_MAX_SIZE ((TCACHE_BINS-1) * 0x10 + MIN_CHUNK_SIZE)
 
-#define CHUNK_MIDDLE(idx) (((((idx) * 0x10 + 0x20) / 2) & ~0xf))
+#define IDX_TO_CHUNK_SIZE(idx) (((idx) * 0x10) + MIN_CHUNK_SIZE)
+#define CHUNK_SIZE_TO_IDX(sz) (((sz) - MIN_CHUNK_SIZE) / 0x10)
+
+#define CHUNK_MIDDLE(idx) (((IDX_TO_CHUNK_SIZE(idx) / 2) & ~0xf))
 #define CHUNK_TO_PTR(x) ((x) + 0x10)
 #define PTR_TO_CHUNK(x) ((x) - 0x10)
 
@@ -40,9 +43,10 @@ typedef struct tcache_entry tcache_entry;
 
 //TCACHE FORAMTTING:
 //-------- PREV SIZE, SIZE  ....... NEXT FD  KEY .....
-typedef struct { //bins store ACTUAL SIZE. meaning HEADER + bin.
+typedef struct {
+    //bins store ACTUAL SIZE. meaning HEADER + bin.
     uint16_t bin_counts[TCACHE_BINS];
-    void* entries[TCACHE_BINS];
+    void *entries[TCACHE_BINS];
 } tcache_perthread_struct;
 
 static __thread tcache_perthread_struct tcache;
@@ -51,52 +55,50 @@ static __thread size_t secret = 0;
 #define ALIGN16(x) (((x) + 0xF) & ~((size_t)0xF))
 
 //Different IDXs map to different chunk locations for better security.
-void* get_next_tcache(size_t idx);
+void *get_next_tcache(size_t idx);
+
 void set_next_tcache(size_t idx, size_t value);
 
 void *secure_malloc(const size_t size) {
     if (secret == 0)
         secret = random();
 
-    const size_t aligned_size = max(ALIGN16(size), MIN_CHUNK_SIZE); //Round to next 0x10. min of 0x20.
+    const size_t total_size = max(ALIGN16(size) + 0x10, MIN_CHUNK_SIZE);
+    const size_t page_aligned_size = (total_size + sizeof(mmap_header) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-    if (aligned_size > MMAP_THRESHOLD) {
-        const size_t page_aligned_size = (aligned_size + sizeof(mmap_header) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (page_aligned_size > MMAP_THRESHOLD) {
         mmap_header *chunk = mmap(NULL, page_aligned_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
         chunk->size = page_aligned_size | CHUNK_MMAPED;
         chunk->cookie = secret ^ page_aligned_size;
-        return (char*)chunk + sizeof(mmap_header);
+        return (char *) chunk + sizeof(mmap_header);
     }
 
     //Let's do tcache (!)
-    if (aligned_size <= TCACHE_CHUNK_MAX_SIZE) {
-        const size_t idx = (aligned_size - MIN_CHUNK_SIZE) / 0x10;
-        printf("idx requested: %lu\n", idx);
+    if (total_size <= TCACHE_CHUNK_MAX_SIZE) {
+        const size_t idx = CHUNK_SIZE_TO_IDX(total_size);
 
         //there is valid bin for this
         if (tcache.bin_counts[idx] > 0) {
-            void* ptr = CHUNK_TO_PTR(tcache.entries[idx]);
-            void* next_ptr = get_next_tcache(idx);
+            void *ptr = CHUNK_TO_PTR(tcache.entries[idx]);
+            void *next_ptr = get_next_tcache(idx);
 
-            set_next_tcache(idx, (size_t)NULL); //Zero out next
+            set_next_tcache(idx, (size_t) NULL); //Zero out next
 
             tcache.entries[idx] = next_ptr;
             tcache.bin_counts[idx]--;
 
-            //Set previnuse of next chunk!
-            if (next_ptr != NULL) {
-                ((uint64_t*)next_ptr)[1] |= CHUNK_PREVINUSE;
-            }
+            //Set previnuse of next physical chunk!
+            ((uint64_t *) ((char*)PTR_TO_CHUNK(ptr) + IDX_TO_CHUNK_SIZE(idx)))[1] |= CHUNK_PREVINUSE;
 
             return ptr;
         }
 
         //there is no valid tcache chunk. Carve from sbrk.
-        void* chunk = sbrk((long)aligned_size + 0x10);
+        void *chunk = sbrk((long)total_size);
 
-        ((uint64_t*)chunk)[0] = 0;
-        ((uint64_t*)chunk)[1] = aligned_size | CHUNK_PREVINUSE;
+        ((uint64_t *) chunk)[0] = 0;
+        ((uint64_t *) chunk)[1] = total_size | CHUNK_PREVINUSE; // SIZE IS ALWAYS CHUNK SIZE! NOT PTR SIZE!
 
         return CHUNK_TO_PTR(chunk);
     }
@@ -108,12 +110,12 @@ void *secure_malloc(const size_t size) {
 void secure_free(void *ptr) {
     if (ptr == NULL) return;
 
-    size_t raw_size = ((size_t*)ptr - 1)[0];
+    size_t raw_size = ((size_t *) ptr - 1)[0];
     printf("received size: %lx\n", raw_size);
 
     if (IS_MMAPED(raw_size)) {
-        size_t size = raw_size & ~FLAG_MASK;
-        size_t cookie = ((size_t*)ptr - 2)[0];
+        const size_t size = raw_size & ~FLAG_MASK;
+        const size_t cookie = ((size_t *) ptr - 2)[0];
 
         if ((secret ^ size) != cookie) {
             printf("\nINCORRECT COOKIE! Refusing free\n");
@@ -125,20 +127,23 @@ void secure_free(void *ptr) {
         return;
     }
 
-    const size_t size = raw_size & ~FLAG_MASK;
-    const size_t idx = (size - MIN_CHUNK_SIZE) / 0x10;
+    const size_t total_size = raw_size & ~FLAG_MASK;
+    const size_t idx = CHUNK_SIZE_TO_IDX(total_size);
 
     if (idx < TCACHE_BINS && tcache.bin_counts[idx] < MAX_CHUNKS_PER_BIN) {
-        void* next = tcache.entries[idx];
+        size_t *next_tcache_entry = tcache.entries[idx];
         tcache.entries[idx] = PTR_TO_CHUNK(ptr);
-        set_next_tcache(idx, (size_t)next);
         tcache.bin_counts[idx]++;
+        set_next_tcache(idx, (size_t) next_tcache_entry);
+
+        size_t *next_physical_chunk = (size_t *) ((char *) PTR_TO_CHUNK(ptr) + total_size);
+        next_physical_chunk[0] = total_size; //set prev size of next chunk.
+        next_physical_chunk[1] &= ~CHUNK_PREVINUSE; //prev chunk is NOT in use.
         return;
     }
 }
 
-//TODO: Every reference of next is to be repalced with middle of chunk access.
-// no point of a chunk.
+
 
 //TODO: In order:
 // tcache
@@ -156,16 +161,16 @@ void secure_free(void *ptr) {
 //  actual mitigations & checks and stuff.
 
 
+void *get_next_tcache(const size_t idx) {
+    void *chunk_header = tcache.entries[idx];
+    const size_t *ptr_to_middle = (size_t *) ((char *) chunk_header + CHUNK_MIDDLE(idx));
+    //that's PTR to chunk mdidle. Now get value.
 
-void* get_next_tcache(const size_t idx) {
-    void* chunk_header = tcache.entries[idx];
-    const size_t* ptr_to_middle = (size_t*)((char*)chunk_header + CHUNK_MIDDLE(idx));  //that's PTR to chunk mdidle. Now get value.
-
-    return (size_t*)*ptr_to_middle; //ret value at ptr as ptr.
+    return (size_t *) *ptr_to_middle; //ret value at ptr as ptr.
 }
 
 void set_next_tcache(const size_t idx, size_t value) {
-    void* chunk_header = tcache.entries[idx];
-    size_t* ptr_to_middle = (size_t*)((char*)chunk_header + CHUNK_MIDDLE(idx));
+    void *chunk_header = tcache.entries[idx];
+    size_t *ptr_to_middle = (size_t *) ((char *) chunk_header + CHUNK_MIDDLE(idx));
     *ptr_to_middle = value;
 }
