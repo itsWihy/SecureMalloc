@@ -34,8 +34,9 @@
 #define CHUNK_SIZE_TO_IDX(sz) (((sz) - MIN_CHUNK_SIZE) / 0x10)
 
 #define CHUNK_MIDDLE(idx) (((IDX_TO_CHUNK_SIZE(idx) / 2) & ~0xf))
-#define CHUNK_TO_PTR(x) ((x) + 0x10)
-#define PTR_TO_CHUNK(x) ((x) - 0x10)
+#define CHUNK_TO_PTR(x) (((void*)(x)) + 0x10)
+#define PTR_TO_CHUNK(x) (((void*)(x)) - 0x10)
+#define CHUNK_SIZE(x) ((x)->size & ~FLAG_MASK)
 
 typedef struct mmap_header {
     size_t cookie;
@@ -63,14 +64,17 @@ typedef struct {
     size_t size;
     //prev is at size/2
     //next is at size/2+1
-    //prev_size is at size/2+2
-    //next_size is at size/2+3
-} largebin_entry;
+} sorted_entry;
 
-static largebin_entry* largebin_head; //holds a linked list.
+static sorted_entry* sorted_head; //holds a linked list.
 
-static size_t* get_ptr_to_largebin_middle(largebin_entry* entry);
-static size_t get_idx_from_size(size_t total_size);
+static sorted_entry* get_prev_sorted(sorted_entry* entry);
+static sorted_entry* get_next_sorted(sorted_entry* entry);
+static void set_prev_sorted(sorted_entry* entry, size_t value);
+static void set_next_sorted(sorted_entry* entry, size_t value);
+
+static size_t* sorted_allocate(size_t size);
+static void sorted_insert(sorted_entry* new_chunk);
 
 void *secure_malloc(const size_t size) {
     if (secret == 0)
@@ -109,25 +113,15 @@ void *secure_malloc(const size_t size) {
         //there is no valid tcache chunk. Continue search.
     }
 
-    //Largebin check!
-    largebin_entry* largebin_ptr = largebin_head;
+    //Sorted check!
+    if (sorted_head != NULL) {
+        void* ptr = sorted_allocate(total_size);
 
-    if (largebin_ptr != NULL) {
-        //get minimally large ptr!
-        while (largebin_ptr->size >= total_size) {
-            const size_t* middle_ptr = get_ptr_to_largebin_middle(largebin_ptr);
-            largebin_ptr = (largebin_entry*)middle_ptr[1];
-        }
-
-        //OK. rn, the PREV is the target!
-        const size_t* middle_ptr = get_ptr_to_largebin_middle(largebin_ptr);
-        largebin_ptr = (largebin_entry*)middle_ptr[0];
-
-        //TODO: Split off the chunk instead of just returning TS
-        return largebin_ptr;
+        if (ptr != NULL)
+            return ptr;
     }
 
-    //continue and fall onto unsorted/fastbin/large/small/gay
+    //continue and fall onto fastbin/large/small/gay
 
     //no largebins at all... just sbrk.
     void *chunk = sbrk((long)total_size);
@@ -170,28 +164,13 @@ void secure_free(void *ptr) {
         return;
     }
 
-    //Free as a largebin chank.
-    if (largebin_head == NULL) {
-        largebin_head = PTR_TO_CHUNK(ptr);
-        largebin_head->prev_size = 0;
-        largebin_head->size      = total_size;
-
-        size_t* largebin_mid = get_ptr_to_largebin_middle(largebin_head);
-        largebin_mid[0] = 0;
-        largebin_mid[1] = 0;
-        largebin_mid[2] = 0;
-        largebin_mid[3] = 0; // ZERO OUT prev, next, prevfd, nextfd
-        //zero out all other PTRs.
-    } else {
-        //find best location.
-
-    }
+    //Free to sorted
+    sorted_insert(PTR_TO_CHUNK(ptr));
 }
 
-
-
 //TODO: In order:
-// tcache
+// tcache V
+// COALESCING!!!!
 // fastbin
 // unsroted
 // large & small mechanism
@@ -199,12 +178,10 @@ void secure_free(void *ptr) {
 // zeroing memory on free...
 // benchmarking if have time!!!! finish it all tmrw gl
 
-
 //first allocation:
 //  mmap a huge ass page. Next allocations: carve from there.
-//  FIRST IMPLEMENT Tcache, fastbin, unsorted, smallbin, largebin. ONLY THEN
+//  FIRST IMPLEMENT Tcache (V), fastbin, sorted, smallbin, largebin. ONLY THEN
 //  actual mitigations & checks and stuff.
-
 
 void *get_next_tcache(const size_t idx) {
     void *chunk_header = tcache.entries[idx];
@@ -220,6 +197,93 @@ void set_next_tcache(const size_t idx, size_t value) {
     *ptr_to_middle = value;
 }
 
-static inline size_t * get_ptr_to_largebin_middle(largebin_entry *entry) {
-    return (size_t*)((char*)entry + (entry->size/2 & ~0xF));
+static sorted_entry * get_prev_sorted(sorted_entry *entry) {
+    return (sorted_entry*) *(size_t*)((char*)entry + (entry->size/2 & ~0xF));
+}
+
+static sorted_entry * get_next_sorted(sorted_entry *entry) {
+    return (sorted_entry*)*((size_t*)((char*)entry + (entry->size/2 & ~0xF)) + 1);
+}
+
+static void set_prev_sorted(sorted_entry *entry, size_t value) {
+    *(size_t*)((char*)entry + (entry->size/2 & ~0xF)) = value;
+}
+static void set_next_sorted(sorted_entry *entry, size_t value) {
+    *((size_t*)((char*)entry + (entry->size/2 & ~0xF)) + 1) = value;
+}
+
+//returns null if none
+// get the best fit.
+static size_t* sorted_allocate(const size_t size) {
+    //TODO: Split off the chunk instead of just returning..
+    //TODO: If all chunks are too small, run coalescing, then run this AGAIN!
+
+    sorted_entry* best_chunk = NULL;
+
+    //Get a chunk that isn't null. The for loop STOPS when iterator < size... so best_chunk was set to the last one where it DOES matter.
+    for (sorted_entry *iterator = sorted_head; iterator != NULL && CHUNK_SIZE(iterator) >= size; iterator = get_next_sorted(iterator)) {
+        best_chunk = iterator;
+    }
+
+    if (best_chunk == NULL)
+        return NULL;
+
+    sorted_entry *prev_chunk = get_prev_sorted(best_chunk);
+    sorted_entry *next_chunk = get_next_sorted(best_chunk);
+
+    if (prev_chunk != NULL)
+        set_next_sorted(prev_chunk, (size_t) next_chunk);
+    else
+        sorted_head = next_chunk;
+
+    if (next_chunk != NULL)
+        set_prev_sorted(next_chunk, (size_t) prev_chunk);
+
+    //reset ptrs... so no leaks!
+    set_prev_sorted(best_chunk, 0);
+    set_next_sorted(best_chunk, 0);
+
+    //set next chunk in use to true
+    ((size_t *) ((char *) best_chunk + CHUNK_SIZE(best_chunk)))[1] |= CHUNK_PREVINUSE;
+
+    return CHUNK_TO_PTR(best_chunk);
+}
+
+void sorted_insert(sorted_entry *new_chunk) {
+    //find best location....
+    //3 cases.            A > target > B
+    //                    A > target > null
+    //                    target > A > B
+
+    const size_t new_size = CHUNK_SIZE(new_chunk);
+    set_prev_sorted(new_chunk, 0);
+    set_next_sorted(new_chunk, 0);
+
+    if (sorted_head == NULL || CHUNK_SIZE(sorted_head) < new_size) { // No list, or biggest. This becomes head.
+        if (sorted_head != NULL)
+            set_prev_sorted(sorted_head, (size_t) new_chunk);
+
+        set_next_sorted(new_chunk, (size_t) sorted_head);
+        sorted_head = new_chunk;
+        return;
+    }
+
+    //Walk the list. Place such that A > taget > B
+    sorted_entry* prev_ptr = sorted_head;
+    sorted_entry* curr_ptr = get_next_sorted(prev_ptr);
+
+    while (curr_ptr != NULL && CHUNK_SIZE(curr_ptr) >= new_size) {
+        prev_ptr = curr_ptr;
+        curr_ptr = get_next_sorted(curr_ptr);
+    }
+
+    //link prev to new
+    set_next_sorted(prev_ptr, (size_t)new_chunk);
+    set_prev_sorted(new_chunk, (size_t)prev_ptr);
+
+    //link new to curr
+    if (curr_ptr != NULL) {
+        set_next_sorted(new_chunk, (size_t)curr_ptr);
+        set_prev_sorted(curr_ptr, (size_t)new_chunk);
+    }
 }

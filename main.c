@@ -14,17 +14,17 @@ int main(void) {
     setvbuf(stdin, NULL, _IONBF, 0); //so printf in allocator doesnt cause issues.
 
     char input_buffer[100];
-    int idx;
+    int idx = 0;
 
     //[*] Function (malloc/free/puts/read/quit):
     while (1) {
         printf("\n[*] Function (malloc/free/write/puts/read/quit): \n");
         fscanf(stdin, "%99s", input_buffer);
-        scanf("%d", &idx);
+        scanf("%zu", &idx);
 
         if (strstr(input_buffer, "malloc") != 0) {
-            size_t alloc_size;
-            scanf("%d", &alloc_size);
+            size_t alloc_size = 0;
+            scanf("%zu", &alloc_size);
 
             void* ptr = secure_malloc(alloc_size);
             alloc_struct[idx] = ptr;
