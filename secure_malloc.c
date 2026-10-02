@@ -2,7 +2,6 @@
 // Created by Wihy on 9/20/26.
 //
 #include "secure_malloc.h"
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,9 +20,6 @@
 #define IS_MMAPED(sz) ((sz) & CHUNK_MMAPED)
 #define IS_PREVINUSE(sz) ((sz) & CHUNK_PREVINUSE)
 
-//largebin stuff
-#define LARGEBIN_BINS 64
-
 //TCACHE STUFF
 #define TCACHE_BINS 64
 #define MAX_CHUNKS_PER_BIN 10
@@ -38,20 +34,23 @@
 #define PTR_TO_CHUNK(x) (((void*)(x)) - 0x10)
 #define CHUNK_SIZE(x) ((x)->size & ~FLAG_MASK)
 
+// So we don't accidentally WRITE on unallocated memory();
+static void* max_heap_address;
+static size_t last_physical_chunk_size;
+
 typedef struct mmap_header {
     size_t cookie;
     size_t size;
 } mmap_header;
 
-//TCACHE FORAMTTING:
-//-------- PREV SIZE, SIZE  ....... NEXT FD .....
+//Tcache chunk formatting:   PREV SIZE, SIZE  ....... NEXT FD .....
 typedef struct {
     uint16_t bin_counts[TCACHE_BINS];
     void *entries[TCACHE_BINS];
 } tcache_perthread_struct;
 
 static __thread tcache_perthread_struct tcache;
-static __thread size_t secret = 0;
+static size_t secret = 0;
 
 #define ALIGN16(x) (((x) + 0xF) & ~((size_t)0xF))
 
@@ -73,7 +72,7 @@ static sorted_entry* get_next_sorted(sorted_entry* entry);
 static void set_prev_sorted(sorted_entry* entry, size_t value);
 static void set_next_sorted(sorted_entry* entry, size_t value);
 
-static size_t* sorted_allocate(size_t size);
+static void* sorted_allocate(size_t size);
 static void sorted_insert(sorted_entry* new_chunk);
 
 void *secure_malloc(const size_t size) {
@@ -105,9 +104,6 @@ void *secure_malloc(const size_t size) {
             tcache.entries[idx] = next_ptr;
             tcache.bin_counts[idx]--;
 
-            //Set previnuse of next physical chunk!
-            ((uint64_t *) ((char*)PTR_TO_CHUNK(ptr) + IDX_TO_CHUNK_SIZE(idx)))[1] |= CHUNK_PREVINUSE;
-
             return ptr;
         }
         //there is no valid tcache chunk. Continue search.
@@ -126,14 +122,24 @@ void *secure_malloc(const size_t size) {
     //no largebins at all... just sbrk.
     void *chunk = sbrk((long)total_size);
 
-    ((uint64_t *) chunk)[0] = 0;
+    ((uint64_t *) chunk)[0] = last_physical_chunk_size;     // prev chank size.. how would I know though.
     ((uint64_t *) chunk)[1] = total_size | CHUNK_PREVINUSE; // SIZE IS ALWAYS CHUNK SIZE! NOT PTR SIZE!
+
+    last_physical_chunk_size = total_size;
+    max_heap_address         = sbrk(0);
+
     return CHUNK_TO_PTR(chunk);}
 
 void secure_free(void *ptr) {
     if (ptr == NULL) return;
 
     const size_t raw_size = ((size_t *) ptr - 1)[0];
+    const size_t total_size = raw_size & ~FLAG_MASK;
+
+    if (total_size < MIN_CHUNK_SIZE || ALIGN16(total_size) != total_size) {
+        puts("Corrupt chunk detected");
+        return;
+    }
 
     if (IS_MMAPED(raw_size)) {
         const size_t size = raw_size & ~FLAG_MASK;
@@ -149,18 +155,19 @@ void secure_free(void *ptr) {
         return;
     }
 
-    const size_t total_size = raw_size & ~FLAG_MASK;
     const size_t idx = CHUNK_SIZE_TO_IDX(total_size);
 
+    //free to tcache
     if (idx < TCACHE_BINS && tcache.bin_counts[idx] < MAX_CHUNKS_PER_BIN) {
         size_t *next_tcache_entry = tcache.entries[idx];
+
+        //link new chunk to tcache.
         tcache.entries[idx] = PTR_TO_CHUNK(ptr);
         tcache.bin_counts[idx]++;
+
         set_next_tcache(idx, (size_t) next_tcache_entry);
 
-        size_t *next_physical_chunk = (size_t *) ((char *) PTR_TO_CHUNK(ptr) + total_size);
-        next_physical_chunk[0] = total_size; //set prev size of next chunk.
-        next_physical_chunk[1] &= ~CHUNK_PREVINUSE; //prev chunk is NOT in use.
+        //Prevent coalescing: Even free tcache chunks should be USED.
         return;
     }
 
@@ -168,20 +175,6 @@ void secure_free(void *ptr) {
     sorted_insert(PTR_TO_CHUNK(ptr));
 }
 
-//TODO: In order:
-// tcache V
-// COALESCING!!!!
-// fastbin
-// unsroted
-// large & small mechanism
-// safe linking add.
-// zeroing memory on free...
-// benchmarking if have time!!!! finish it all tmrw gl
-
-//first allocation:
-//  mmap a huge ass page. Next allocations: carve from there.
-//  FIRST IMPLEMENT Tcache (V), fastbin, sorted, smallbin, largebin. ONLY THEN
-//  actual mitigations & checks and stuff.
 
 void *get_next_tcache(const size_t idx) {
     void *chunk_header = tcache.entries[idx];
@@ -214,7 +207,7 @@ static void set_next_sorted(sorted_entry *entry, size_t value) {
 
 //returns null if none
 // get the best fit.
-static size_t* sorted_allocate(const size_t size) {
+static void* sorted_allocate(const size_t size) {
     //TODO: Split off the chunk instead of just returning..
     //TODO: If all chunks are too small, run coalescing, then run this AGAIN!
 
@@ -243,8 +236,13 @@ static size_t* sorted_allocate(const size_t size) {
     set_prev_sorted(best_chunk, 0);
     set_next_sorted(best_chunk, 0);
 
-    //set next chunk in use to true
-    ((size_t *) ((char *) best_chunk + CHUNK_SIZE(best_chunk)))[1] |= CHUNK_PREVINUSE;
+    //set next chunk in use to true only if not the last chunk
+    //if chunk is last, we save its size for futrue mallocs. So we know the size of the last chunk..
+    sorted_entry* physical_next_chunk = (sorted_entry*)((char *) best_chunk + CHUNK_SIZE(best_chunk));
+
+    if ((void*)physical_next_chunk < max_heap_address) { // ONLY WRITE ON ALLOC MEM!
+        ((size_t *) ((char *) best_chunk + CHUNK_SIZE(best_chunk)))[1] |= CHUNK_PREVINUSE;
+    }
 
     return CHUNK_TO_PTR(best_chunk);
 }

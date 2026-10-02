@@ -52,3 +52,14 @@ int main(void) {
     }
     return 0;
 }
+
+
+//TODO:
+// - fix writing over heap break on free.... check if over heap_next bro V
+
+// - add chunk splitting when allocating very big chunk to avoid fragmentation
+// - coalescing
+// - thread safety on parallel mallocs.
+// - workflow sheet & DONE!
+
+// afterwards: -safelinking.
