@@ -57,8 +57,12 @@ int main(void) {
 //TODO:
 // - fix writing over heap break on free.... check if over heap_next bro V
 // - add chunk splitting when allocating very big chunk to avoid fragmentation V
+// - coalescing V
 
-// - coalescing
+//Cleanup
+//Thread safety
+//Heap checker & testing
+//Write workflow, show how can not be exploited while nomral CAN. 
 
 // - heap checker maybe?
 // - thread safety on parallel mallocs.
