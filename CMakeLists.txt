@@ -3,9 +3,9 @@ project(SecureMalloc C)
 
 set(CMAKE_C_STANDARD 11)
 
-add_executable(SecureMalloc main.c
-        secure_malloc.c
-        secure_malloc.h
-        utils/utils.c
-        utils/utils.h
+add_executable(SecureMalloc src/main.c
+        src/allocator/secure_malloc.c
+        src/allocator/secure_malloc.h
+        src/utils/utils.c
+        src/utils/utils.h
 )

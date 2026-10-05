@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "secure_malloc.h"
+#include "allocator/secure_malloc.h"
 #include <pthread.h>
 #include <unistd.h>
 

@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "utils/utils.h"
+#include "../utils/utils.h"
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -37,6 +37,7 @@
 // So we don't accidentally WRITE on unallocated memory();
 static void* max_heap_address;
 static size_t last_physical_chunk_size;
+static int last_chunk_free;
 
 typedef struct mmap_header {
     size_t cookie;
@@ -72,8 +73,13 @@ static sorted_entry* get_next_sorted(sorted_entry* entry);
 static void set_prev_sorted(sorted_entry* entry, size_t value);
 static void set_next_sorted(sorted_entry* entry, size_t value);
 
-static void* sorted_allocate(size_t size);
+static void* sorted_allocate(size_t total_size);
+static void sorted_unlink(sorted_entry* chunk);
 static void sorted_insert(sorted_entry* new_chunk);
+
+static void write_flag_preserve(size_t* ptr, const size_t total_size) {
+    *ptr = *ptr & FLAG_MASK | total_size;
+}
 
 void *secure_malloc(const size_t size) {
     if (secret == 0)
@@ -122,11 +128,11 @@ void *secure_malloc(const size_t size) {
     //no largebins at all... just sbrk.
     void *chunk = sbrk((long)total_size);
 
-    ((uint64_t *) chunk)[0] = last_physical_chunk_size;     // prev chank size.. how would I know though.
-    ((uint64_t *) chunk)[1] = total_size | CHUNK_PREVINUSE; // SIZE IS ALWAYS CHUNK SIZE! NOT PTR SIZE!
+    ((uint64_t *) chunk)[0] = last_physical_chunk_size;                                  // prev chunk size
+    ((uint64_t *) chunk)[1] = total_size | (last_chunk_free == 1 ? 0 : CHUNK_PREVINUSE); // SIZE IS ALWAYS CHUNK SIZE! NOT PTR SIZE!
 
     last_physical_chunk_size = total_size;
-    max_heap_address         = sbrk(0);
+    max_heap_address         = chunk + total_size;
 
     return CHUNK_TO_PTR(chunk);}
 
@@ -142,15 +148,14 @@ void secure_free(void *ptr) {
     }
 
     if (IS_MMAPED(raw_size)) {
-        const size_t size = raw_size & ~FLAG_MASK;
         const size_t cookie = ((size_t *) ptr - 2)[0];
 
-        if ((secret ^ size) != cookie) {
+        if ((secret ^ total_size) != cookie) {
             printf("\nINCORRECT COOKIE! Refusing free\n");
             return;
         }
 
-        const int result = munmap(ptr - sizeof(mmap_header), size);
+        const int result = munmap(ptr - sizeof(mmap_header), total_size);
         printf("(%d) Unmapped %p \n", result, ptr);
         return;
     }
@@ -178,9 +183,7 @@ void secure_free(void *ptr) {
 
 void *get_next_tcache(const size_t idx) {
     void *chunk_header = tcache.entries[idx];
-    const size_t *ptr_to_middle = (size_t *) ((char *) chunk_header + CHUNK_MIDDLE(idx));
-    //that's PTR to chunk mdidle. Now get value.
-
+    const size_t *ptr_to_middle = (size_t *) ((char *) chunk_header + CHUNK_MIDDLE(idx)); //that's PTR to chunk mdidle. Now get value.
     return (size_t *) *ptr_to_middle; //ret value at ptr as ptr.
 }
 
@@ -205,46 +208,77 @@ static void set_next_sorted(sorted_entry *entry, size_t value) {
     *((size_t*)((char*)entry + (entry->size/2 & ~0xF)) + 1) = value;
 }
 
-//returns null if none
+// returns null if none
 // get the best fit.
-static void* sorted_allocate(const size_t size) {
+static void* sorted_allocate(const size_t total_size) {
     //TODO: Split off the chunk instead of just returning..
     //TODO: If all chunks are too small, run coalescing, then run this AGAIN!
 
     sorted_entry* best_chunk = NULL;
 
     //Get a chunk that isn't null. The for loop STOPS when iterator < size... so best_chunk was set to the last one where it DOES matter.
-    for (sorted_entry *iterator = sorted_head; iterator != NULL && CHUNK_SIZE(iterator) >= size; iterator = get_next_sorted(iterator)) {
+    for (sorted_entry *iterator = sorted_head; iterator != NULL && CHUNK_SIZE(iterator) >= total_size; iterator = get_next_sorted(iterator)) {
         best_chunk = iterator;
     }
 
     if (best_chunk == NULL)
         return NULL;
 
-    sorted_entry *prev_chunk = get_prev_sorted(best_chunk);
-    sorted_entry *next_chunk = get_next_sorted(best_chunk);
+    const size_t best_chunk_og_size = CHUNK_SIZE(best_chunk);
+    sorted_unlink(best_chunk); //Remove our chunk from the sorted list
 
-    if (prev_chunk != NULL)
-        set_next_sorted(prev_chunk, (size_t) next_chunk);
-    else
-        sorted_head = next_chunk;
+    //Split if the chunk is too big:
+    if (best_chunk_og_size >= total_size + MIN_CHUNK_SIZE) {
+        // So split, unlink, insert.
 
-    if (next_chunk != NULL)
-        set_prev_sorted(next_chunk, (size_t) prev_chunk);
+        //best_prev -> best_next
+        //Split:
+        // Write new size to best_chunk
+        // Write new chunk somewhere.
 
-    //reset ptrs... so no leaks!
-    set_prev_sorted(best_chunk, 0);
-    set_next_sorted(best_chunk, 0);
+        //set size of best_chunk to less!
+        write_flag_preserve(&best_chunk->size, total_size);
 
-    //set next chunk in use to true only if not the last chunk
-    //if chunk is last, we save its size for futrue mallocs. So we know the size of the last chunk..
-    sorted_entry* physical_next_chunk = (sorted_entry*)((char *) best_chunk + CHUNK_SIZE(best_chunk));
+        //write a new fake chunk... NO NEED to LINK it... just set size. prev_size = best_chunk_size | CHUNK_PREVINUSE!
+        sorted_entry* new_split_chunk = (sorted_entry*)((char *) best_chunk + CHUNK_SIZE(best_chunk));
 
-    if ((void*)physical_next_chunk < max_heap_address) { // ONLY WRITE ON ALLOC MEM!
-        ((size_t *) ((char *) best_chunk + CHUNK_SIZE(best_chunk)))[1] |= CHUNK_PREVINUSE;
+        new_split_chunk->prev_size = CHUNK_SIZE(best_chunk); //Its just best chunk, which is TAKEN cuz we JUST allocated it.
+        new_split_chunk->size      = (best_chunk_og_size - total_size) | CHUNK_PREVINUSE;
+
+        sorted_insert(new_split_chunk);
+
+        //In case we SPLIT the LAST CHUNK, update last_chunk_size!
+        if ((char*)max_heap_address == (char*)new_split_chunk + CHUNK_SIZE(new_split_chunk)) {
+            last_physical_chunk_size = CHUNK_SIZE(new_split_chunk);
+            last_chunk_free = 1;
+        }
+    } else {
+        //We didn't split. So the prev of next is NOT INUSE.
+        sorted_entry* physical_next_chunk = (sorted_entry*)((char *) best_chunk + CHUNK_SIZE(best_chunk));
+
+        //set next chunk PREVINUSE only if WE DIDNT ALLOCATE THE LAST CHUNK so we dont write on unallocated mem.
+        if ((void*)physical_next_chunk < max_heap_address) {
+            ((size_t *) ((char *) best_chunk + CHUNK_SIZE(best_chunk)))[1] |= CHUNK_PREVINUSE;
+            last_chunk_free = 0;
+        }
     }
 
     return CHUNK_TO_PTR(best_chunk);
+}
+
+// remove a chunk from the unsorted list. Execute BEFORE changing size.. cuz it depedns on it.
+void sorted_unlink(sorted_entry *chunk) {
+    sorted_entry* prev = get_prev_sorted(chunk);
+    sorted_entry* next = get_next_sorted(chunk);
+
+    if (prev != NULL) set_next_sorted(prev, (size_t)next);
+    else sorted_head = next;
+
+    if (next != NULL)  set_prev_sorted(next, (size_t)prev);
+
+    //now clear the hcunk.
+    set_prev_sorted(chunk, 0);
+    set_next_sorted(chunk, 0);
 }
 
 void sorted_insert(sorted_entry *new_chunk) {
@@ -252,8 +286,16 @@ void sorted_insert(sorted_entry *new_chunk) {
     //3 cases.            A > target > B
     //                    A > target > null
     //                    target > A > B
-
     const size_t new_size = CHUNK_SIZE(new_chunk);
+
+    //set next prevsize, previnuse, etc.
+    sorted_entry* next_physical = (sorted_entry*)((char*)new_chunk + new_size);
+
+    if ((void*)next_physical < max_heap_address) { //only write on allocated memory
+        next_physical->prev_size = new_size;
+        next_physical->size &= ~CHUNK_PREVINUSE; //Cuz it isn't in use anymore.
+    }
+
     set_prev_sorted(new_chunk, 0);
     set_next_sorted(new_chunk, 0);
 
