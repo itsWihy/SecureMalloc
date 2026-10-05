@@ -6,6 +6,9 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 size_t max(const size_t a, const size_t b) {
     return a > b ? a : b;
@@ -32,4 +35,9 @@ void hexdump(void *ptr, size_t size) {
 
         puts("|");
     }
+}
+
+void die(const char *message) {
+    write(STDERR_FILENO, message, strlen(message));
+    abort();
 }

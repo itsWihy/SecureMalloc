@@ -8,5 +8,6 @@
 
 size_t max(size_t a, size_t b);
 void hexdump(void *ptr, size_t size);
+void die(const char* message);
 
 #endif //SECUREMALLOC_UTILS_H
