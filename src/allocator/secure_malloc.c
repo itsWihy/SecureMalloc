@@ -10,9 +10,12 @@
  */
 
 #include "secure_malloc.h"
+
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/random.h>
 
 #include "../utils/utils.h"
 #include "mmap_helper.h"
@@ -79,15 +82,22 @@ static void set_chunk_size(sorted_entry *chunk, const size_t total_size) {
     chunk->size = chunk->size & FLAG_MASK | total_size;
 }
 
+static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+static void initialize_secret() {
+    getrandom(&secret, sizeof(secret), 0);
+}
+
 void *secure_malloc(const size_t size) {
-    if (secret == 0)
-        secret = random();
+    if (size > (SIZE_MAX / 2)) {
+        fprintf(stderr, "Secure alloc requested size is too big");
+        return NULL;
+    }
+
+    pthread_once(&once, initialize_secret);
 
     const size_t total_size = max(ALIGN16(size) + CHUNK_HEADER_SIZE, MIN_CHUNK_SIZE);
     const size_t page_aligned_size = (total_size + sizeof(mmap_header) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-    if (page_aligned_size > MMAP_THRESHOLD)
-        return mmap_allocate(page_aligned_size, secret);
 
     //Let's do tcache (!)
     if (total_size <= TCACHE_CHUNK_MAX_SIZE) {
@@ -108,6 +118,10 @@ void *secure_malloc(const size_t size) {
         //there is no valid tcache chunk. Continue search.
     }
 
+    //everything below requires locking.
+    if (page_aligned_size > MMAP_THRESHOLD)
+        return mmap_allocate(page_aligned_size, secret);
+
     //Sorted check!
     if (sorted_head != NULL) {
         void* ptr = sorted_allocate(total_size);
@@ -118,6 +132,11 @@ void *secure_malloc(const size_t size) {
 
     void *chunk = sbrk((long)total_size);
 
+    if (chunk == (void*)-1) {
+        fprintf(stderr, "Secure alloc requested size couldn't be fulfilled.");
+        return NULL;
+    }
+
     ((uint64_t *) chunk)[0] = last_chunk_size;                                  // prev chunk size
     ((uint64_t *) chunk)[1] = total_size | (last_chunk_is_free == 1 ? 0 : CHUNK_PREVINUSE); // SIZE IS ALWAYS CHUNK SIZE! NOT PTR SIZE!
 
@@ -127,7 +146,6 @@ void *secure_malloc(const size_t size) {
 
     return CHUNK_TO_PTR(chunk);
 }
-
 
 void secure_free(void *ptr) {
     if (ptr == NULL) return;
@@ -210,7 +228,7 @@ void sorted_coalesce(sorted_entry *chunk) {
     sorted_unlink(prev);
     sorted_unlink(chunk);
 
-    set_chunk_size(chunk, CHUNK_SIZE(prev) + CHUNK_SIZE(chunk));
+    set_chunk_size(prev, CHUNK_SIZE(prev) + CHUNK_SIZE(chunk));
 
     //Handles correcting prevsize for us
     sorted_insert(prev);
