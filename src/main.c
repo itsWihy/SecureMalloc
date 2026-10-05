@@ -47,7 +47,7 @@ int main(void) {
 
         if (strstr(input_buffer, "write") != 0) {
             void* ptr = alloc_struct[idx];
-            hexdump(ptr-0x10, 0x100);
+            hexdump(ptr-0x10, 0xf00);
         }
     }
     return 0;
@@ -56,9 +56,11 @@ int main(void) {
 
 //TODO:
 // - fix writing over heap break on free.... check if over heap_next bro V
+// - add chunk splitting when allocating very big chunk to avoid fragmentation V
 
-// - add chunk splitting when allocating very big chunk to avoid fragmentation
 // - coalescing
+
+// - heap checker maybe?
 // - thread safety on parallel mallocs.
 // - workflow sheet & DONE!
 

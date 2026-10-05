@@ -8,7 +8,6 @@
 
 #include "../utils/utils.h"
 #include "mmap_helper.h"
-#include <sys/mman.h>
 #include <unistd.h>
 
 #define PAGE_SIZE       (4096)
@@ -58,6 +57,8 @@ typedef struct {
 
 static sorted_entry* sorted_head; //holds a linked list.
 
+static int is_last_chunk(sorted_entry *chunk);
+
 static sorted_entry* get_prev_sorted(sorted_entry* entry);
 static sorted_entry* get_next_sorted(sorted_entry* entry);
 static void set_prev_sorted(sorted_entry* entry, size_t value);
@@ -66,6 +67,7 @@ static void set_next_sorted(sorted_entry* entry, size_t value);
 static void* sorted_allocate(size_t total_size);
 static void sorted_unlink(sorted_entry* chunk);
 static void sorted_insert(sorted_entry* new_chunk);
+static void sorted_coalesce(sorted_entry* chunk);
 
 static void write_flag_preserve(size_t* ptr, const size_t total_size) {
     *ptr = *ptr & FLAG_MASK | total_size;
@@ -108,15 +110,14 @@ void *secure_malloc(const size_t size) {
             return ptr;
     }
 
-    //continue and fall onto fastbin/large/small/gay
 
-    //no largebins at all... just sbrk.
     void *chunk = sbrk((long)total_size);
 
     ((uint64_t *) chunk)[0] = last_physical_chunk_size;                                  // prev chunk size
     ((uint64_t *) chunk)[1] = total_size | (last_chunk_free == 1 ? 0 : CHUNK_PREVINUSE); // SIZE IS ALWAYS CHUNK SIZE! NOT PTR SIZE!
 
     last_physical_chunk_size = total_size;
+    last_chunk_free          = 0;
     max_heap_address         = chunk + total_size;
 
     return CHUNK_TO_PTR(chunk);
@@ -155,8 +156,9 @@ void secure_free(void *ptr) {
         return;
     }
 
-    //Free to sorted
+    //Free to sorted && Try coalescing
     sorted_insert(PTR_TO_CHUNK(ptr));
+    sorted_coalesce(PTR_TO_CHUNK(ptr));
 }
 
 
@@ -170,6 +172,48 @@ void set_next_tcache(const size_t idx, const size_t value) {
     void *chunk_header = tcache.entries[idx];
     size_t *ptr_to_middle = (size_t *) ((char *) chunk_header + CHUNK_MIDDLE(idx));
     *ptr_to_middle = value;
+}
+
+void sorted_coalesce(sorted_entry *chunk) {
+    sorted_entry* next = (sorted_entry*)((char*)chunk + CHUNK_SIZE(chunk));
+    sorted_entry* next_next = NULL;
+
+    if ((void*)next < max_heap_address)
+        next_next = (sorted_entry*)((char*)next + CHUNK_SIZE(next));
+
+    //PREV IN USE && NEXT IS LAST CHUNK && LAST IS FREE
+    //   coalesce chunk & next
+    if (!is_last_chunk(chunk) && is_last_chunk(next) && last_chunk_free == 1) {
+       //coalesce CHUNK with next...
+        sorted_unlink(next);
+        sorted_unlink(chunk);
+
+        write_flag_preserve(&chunk->size, CHUNK_SIZE(chunk) + CHUNK_SIZE(next));
+        sorted_insert(chunk);
+    }
+
+    //PREV IN USE && NEXT NEXT >= LAST CHUNK && PREVINUSE OF NEXT NEXT IS FREE, AKA NEXT IS FREE:
+    //  coalesce chunk & next
+    //  set PREV SIZE of NEXT NEXT>
+    if (!is_last_chunk(chunk) && !is_last_chunk(next) && next_next != NULL && !IS_PREVINUSE(next_next->size)) {
+        sorted_unlink(next);
+        sorted_unlink(chunk);
+
+        write_flag_preserve(&chunk->size, CHUNK_SIZE(chunk) + CHUNK_SIZE(next));
+        next_next->prev_size = CHUNK_SIZE(chunk);
+        sorted_insert(chunk);
+    }
+
+    if (IS_PREVINUSE(chunk->size)) return; //THis also handles CHUNK being FIRST.
+
+    sorted_entry* prev = (sorted_entry*)((char*)chunk - chunk->prev_size);
+    sorted_unlink(prev);
+    sorted_unlink(chunk);
+
+    write_flag_preserve(&prev->size, CHUNK_SIZE(prev) + CHUNK_SIZE(chunk));
+
+    //Handles correcting prevsize for us
+    sorted_insert(prev);
 }
 
 static sorted_entry * get_prev_sorted(sorted_entry *entry) {
@@ -187,12 +231,13 @@ static void set_next_sorted(sorted_entry *entry, size_t value) {
     *((size_t*)((char*)entry + (entry->size/2 & ~0xF)) + 1) = value;
 }
 
+static int is_last_chunk(sorted_entry *chunk) {
+    return (char *) max_heap_address == (char *) chunk + CHUNK_SIZE(chunk);
+}
+
 // returns null if none
 // get the best fit.
 static void* sorted_allocate(const size_t total_size) {
-    //TODO: Split off the chunk instead of just returning..
-    //TODO: If all chunks are too small, run coalescing, then run this AGAIN!
-
     sorted_entry* best_chunk = NULL;
 
     //Get a chunk that isn't null. The for loop STOPS when iterator < size... so best_chunk was set to the last one where it DOES matter.
@@ -227,7 +272,7 @@ static void* sorted_allocate(const size_t total_size) {
         sorted_insert(new_split_chunk);
 
         //In case we SPLIT the LAST CHUNK, update last_chunk_size!
-        if ((char*)max_heap_address == (char*)new_split_chunk + CHUNK_SIZE(new_split_chunk)) {
+        if (is_last_chunk(new_split_chunk)) {
             last_physical_chunk_size = CHUNK_SIZE(new_split_chunk);
             last_chunk_free = 1;
         }
@@ -237,7 +282,8 @@ static void* sorted_allocate(const size_t total_size) {
 
         //set next chunk PREVINUSE only if WE DIDNT ALLOCATE THE LAST CHUNK so we dont write on unallocated mem.
         if ((void*)physical_next_chunk < max_heap_address) {
-            ((size_t *) ((char *) best_chunk + CHUNK_SIZE(best_chunk)))[1] |= CHUNK_PREVINUSE;
+           physical_next_chunk->size |= CHUNK_PREVINUSE;
+        } else { //we allocated the LAST chunk.. so it isn't free.
             last_chunk_free = 0;
         }
     }
@@ -273,6 +319,9 @@ void sorted_insert(sorted_entry *new_chunk) {
     if ((void*)next_physical < max_heap_address) { //only write on allocated memory
         next_physical->prev_size = new_size;
         next_physical->size &= ~CHUNK_PREVINUSE; //Cuz it isn't in use anymore.
+    } else { //This is the LAST chunk we just freed
+        last_chunk_free = 1;
+        last_physical_chunk_size = new_size;
     }
 
     set_prev_sorted(new_chunk, 0);
