@@ -8,4 +8,6 @@ add_executable(SecureMalloc src/main.c
         src/allocator/secure_malloc.h
         src/utils/utils.c
         src/utils/utils.h
+        src/allocator/mmap_helper.c
+        src/allocator/mmap_helper.h
 )

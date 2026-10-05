@@ -7,17 +7,12 @@
 #include <stdlib.h>
 
 #include "../utils/utils.h"
+#include "mmap_helper.h"
 #include <sys/mman.h>
 #include <unistd.h>
 
 #define PAGE_SIZE       (4096)
-#define MMAP_THRESHOLD (128 * 1024)
 
-#define FLAG_MASK    0xFUL
-#define CHUNK_MMAPED    0x2UL
-#define CHUNK_PREVINUSE 0x1
-
-#define IS_MMAPED(sz) ((sz) & CHUNK_MMAPED)
 #define IS_PREVINUSE(sz) ((sz) & CHUNK_PREVINUSE)
 
 //TCACHE STUFF
@@ -38,11 +33,6 @@
 static void* max_heap_address;
 static size_t last_physical_chunk_size;
 static int last_chunk_free;
-
-typedef struct mmap_header {
-    size_t cookie;
-    size_t size;
-} mmap_header;
 
 //Tcache chunk formatting:   PREV SIZE, SIZE  ....... NEXT FD .....
 typedef struct {
@@ -88,13 +78,8 @@ void *secure_malloc(const size_t size) {
     const size_t total_size = max(ALIGN16(size) + 0x10, MIN_CHUNK_SIZE);
     const size_t page_aligned_size = (total_size + sizeof(mmap_header) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-    if (page_aligned_size > MMAP_THRESHOLD) {
-        mmap_header *chunk = mmap(NULL, page_aligned_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-        chunk->size = page_aligned_size | CHUNK_MMAPED;
-        chunk->cookie = secret ^ page_aligned_size;
-        return (char *) chunk + sizeof(mmap_header);
-    }
+    if (page_aligned_size > MMAP_THRESHOLD)
+        return mmap_allocate(page_aligned_size, secret);
 
     //Let's do tcache (!)
     if (total_size <= TCACHE_CHUNK_MAX_SIZE) {
@@ -134,7 +119,9 @@ void *secure_malloc(const size_t size) {
     last_physical_chunk_size = total_size;
     max_heap_address         = chunk + total_size;
 
-    return CHUNK_TO_PTR(chunk);}
+    return CHUNK_TO_PTR(chunk);
+}
+
 
 void secure_free(void *ptr) {
     if (ptr == NULL) return;
@@ -148,15 +135,7 @@ void secure_free(void *ptr) {
     }
 
     if (IS_MMAPED(raw_size)) {
-        const size_t cookie = ((size_t *) ptr - 2)[0];
-
-        if ((secret ^ total_size) != cookie) {
-            printf("\nINCORRECT COOKIE! Refusing free\n");
-            return;
-        }
-
-        const int result = munmap(ptr - sizeof(mmap_header), total_size);
-        printf("(%d) Unmapped %p \n", result, ptr);
+        mmap_free(ptr, total_size, secret);
         return;
     }
 
@@ -187,7 +166,7 @@ void *get_next_tcache(const size_t idx) {
     return (size_t *) *ptr_to_middle; //ret value at ptr as ptr.
 }
 
-void set_next_tcache(const size_t idx, size_t value) {
+void set_next_tcache(const size_t idx, const size_t value) {
     void *chunk_header = tcache.entries[idx];
     size_t *ptr_to_middle = (size_t *) ((char *) chunk_header + CHUNK_MIDDLE(idx));
     *ptr_to_middle = value;
