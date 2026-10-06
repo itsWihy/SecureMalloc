@@ -19,6 +19,10 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stdin, NULL, _IONBF, 0); //so printf in allocator doesnt cause issues.
 
+    // printf("Free leak: %llx", sbrk(0));
+
+    interactive_repl();
+
     // secure_malloc_demo();
     // interactive_repl();
     int tests = 10000;
@@ -65,9 +69,12 @@ void interactive_repl() {
     int idx = 0;
 
     //[*] Function (malloc/free/puts/read/quit):
+
     while (1) {
-        printf("\n[*] Function (malloc/free/write/secure_malloc/secure_free/secure_write): \n");
+        printf("\n[*] Function (malloc/free/write/read/secure_malloc/secure_free/secure_write/secure_read): \n");
         fscanf(stdin, "%99s", input_buffer);
+
+        //All cmds read an index
         scanf("%zu", &idx);
 
         if (strstr(input_buffer, "secure_malloc") != 0) {
@@ -76,22 +83,62 @@ void interactive_repl() {
 
             void* ptr = secure_malloc(alloc_size);
             secure_alloc_struct[idx] = ptr;
+            printf("secure_allocation[%d] of size 0x%lx\n", idx, alloc_size);
+            printf("secure_allocation[%d] = %p\n", idx, ptr);
+            continue;
+        }
 
+        if (strstr(input_buffer, "secure_free") != 0) {
+            void* ptr = secure_alloc_struct[idx];
+            secure_free(ptr);
+            printf("secure_allocation[%d] = %p freed.\n", idx, ptr);
+            continue;
+        }
+
+        if (strstr(input_buffer, "secure_write") != 0) {
+            void* ptr = secure_alloc_struct[idx];
+            write(STDOUT_FILENO, ptr, 0x100);
+            hexdump(ptr, 0x100);
+            continue;
+        }
+
+        if (strstr(input_buffer, "secure_read") != 0) {
+            void* ptr = secure_alloc_struct[idx];
+            ssize_t read_bytes = read(STDIN_FILENO, ptr, 1000);
+            printf("Read %zu bytes into secure allocation [%d].", read_bytes, idx);
+            continue;
+        }
+
+        //-------------------------
+        if (strstr(input_buffer, "malloc") != 0) {
+            size_t alloc_size = 0;
+            scanf("%zu", &alloc_size);
+            void* ptr = malloc(alloc_size);
+            alloc_struct[idx] = ptr;
             printf("allocation[%d] of size 0x%lx\n", idx, alloc_size);
             printf("allocation[%d] = %p\n", idx, ptr);
             continue;
         }
 
         if (strstr(input_buffer, "free") != 0) {
-            void* ptr = secure_alloc_struct[idx];
-            secure_free(ptr);
-
+            void* ptr = alloc_struct[idx];
+            free(ptr);
             printf("allocation[%d] = %p freed.\n", idx, ptr);
+            continue;
         }
 
         if (strstr(input_buffer, "write") != 0) {
-            void* ptr = secure_alloc_struct[idx];
-            hexdump(ptr-0x10, 0xf00);
+            void* ptr = alloc_struct[idx];
+            write(STDOUT_FILENO, ptr, 0x100);
+            hexdump(ptr-0x10, 0x100);
+            continue;
+        }
+
+        if (strstr(input_buffer, "read") != 0) {
+            void* ptr = alloc_struct[idx];
+            ssize_t read_bytes = read(STDIN_FILENO, ptr, 1000);
+            printf("Read %zu bytes into allocation [%d].", read_bytes, idx);
+            continue;
         }
     }
 }

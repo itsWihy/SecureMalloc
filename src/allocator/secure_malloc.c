@@ -463,7 +463,6 @@ void validate_heap() {
                     die("Invalid free chunk!");
             }
         }
-
     }
 
     if (chunk != heap_end_address)
