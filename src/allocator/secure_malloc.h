@@ -16,7 +16,16 @@
 #define SET_PREVINUSE(chunk)  ((chunk)->size |= CHUNK_PREVINUSE)
 #define ZERO_PREVINUSE(chunk) ((chunk)->size &= ~CHUNK_PREVINUSE)
 
+typedef struct {
+    size_t prev_size;
+    size_t size;
+    size_t cookie;
+    //prev is at size/2
+    //next is at size/2+1
+} chunk_entry;
+
 void *secure_malloc(size_t size);
 void secure_free(void *ptr);
+void validate_heap();
 
 #endif //SECUREMALLOC_SECURE_MALLOC_H
